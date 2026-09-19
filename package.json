@@ -1,0 +1,71 @@
+{
+  "name": "@argszero/cordis-plugin-orphan-tool-call-guard",
+  "description": "Orphan tool-call guard for dsh: a recorded tool call whose result was never durably recorded (a throwing tool scheduler `prepare`, a rejected dispatch, a cancelled turn) leaves an assistant tool_calls block the provider refuses on every later request, permanently poisoning the session. Mounted on the documented `llm/stream` waterfall, this plugin supplies the missing tool result to the outgoing request in `repair.ts`'s own synthetic shape, so the session is usable again — without writing a synthetic result into a log whose package-owned runtime invariant forbids exactly that write. Source: discussion #7129. Compatible with the dsh 0.1.2, 0.1.3, 0.1.5 and 0.1.6 prerelease lines.",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/argszero/cordis-plugin-orphan-tool-call-guard.git"
+  },
+  "homepage": "https://github.com/argszero/cordis-plugin-orphan-tool-call-guard#readme",
+  "bugs": {
+    "url": "https://github.com/argszero/cordis-plugin-orphan-tool-call-guard/issues"
+  },
+  "keywords": [
+    "cordis",
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "tool-call",
+    "session-recovery"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.2.0 || >=0.1.3-alpha.2 <0.2.0 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-session": "0.1.6-alpha.2",
+    "@types/node": "^22.10.2",
+    "semver": "^7.6.0",
+    "typescript": "^5.5.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "pretest": "tsc",
+    "prepublishOnly": "tsc",
+    "test": "node --test \"test/*.spec.mjs\""
+  }
+}

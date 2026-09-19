@@ -1,0 +1,18 @@
+# The @argszero/cordis-plugin-orphan-tool-call-guard bundle patch.
+#
+# It needs no deployment-specific config to mount. With an empty config the
+# guard answers every unpaired tool call in the outgoing request with the
+# synthetic result `repair.ts` uses, and dispatches the repaired request.
+#
+#   - insert:
+#       - id: orphan-tool-call-guard
+#         config:
+#           mode: repair     # repair (default) supplies the result; observe only reports
+#           maxRepairs: 64   # circuit breaker: above this the request is left alone
+#
+# Inside a bundle whose patch already has rows, add the same `insert` entry
+# instead of a second document.
+
+- insert:
+    - id: orphan-tool-call-guard
+      name: '@argszero/cordis-plugin-orphan-tool-call-guard'
