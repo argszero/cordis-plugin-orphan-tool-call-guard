@@ -124,6 +124,24 @@ proves the fixture really is refused, the synthetic message is checked against
 `interruptedTurnClosers()` rather than a copy of its wording, and the last test
 runs the repaired stream through the shipped `@deepseek-ai/dsh-llm/invariant`.
 
+### Against the provider's own serializer
+
+```sh
+npm run build && npm run probe:serializer
+```
+
+That suite stands in for the provider backend, so it never reaches the component
+that actually refuses a poisoned session: the provider package's Messages
+serializer, which throws `INVALID_REQUEST` while building the request body,
+before a socket is opened. `scripts/probe-real-serializer.mjs` closes that gap
+by driving the published `@deepseek-ai/dsh-llm-deepseek` adapter over both
+unpaired shapes — an orphan followed by a later turn, and an orphan the history
+ends on, which the serializer refuses from two different lines — with
+`globalThis.fetch` stubbed to record the call and then throw. Each shape is
+asserted twice: unguarded it is refused with zero calls made, guarded the same
+transcript is built and dispatched, and the captured body is checked to answer
+the call in the very next wire message.
+
 ## License
 
 MIT

@@ -1,6 +1,6 @@
 {
   "name": "@argszero/cordis-plugin-orphan-tool-call-guard",
-  "description": "Orphan tool-call guard for dsh: a recorded tool call whose result was never durably recorded (a throwing tool scheduler `prepare`, a rejected dispatch, a cancelled turn) leaves an assistant tool_calls block the provider refuses on every later request, permanently poisoning the session. Mounted on the documented `llm/stream` waterfall, this plugin supplies the missing tool result to the outgoing request in `repair.ts`'s own synthetic shape, so the session is usable again — without writing a synthetic result into a log whose package-owned runtime invariant forbids exactly that write. Source: discussion #7129. Compatible with the dsh 0.1.2, 0.1.3, 0.1.5 and 0.1.6 prerelease lines.",
+  "description": "Orphan tool-call guard for dsh: a recorded tool call whose result was never durably recorded (a throwing tool scheduler `prepare`, a rejected dispatch, a cancelled turn) leaves an assistant tool_calls block the provider refuses on every later request, permanently poisoning the session. Mounted on the documented `llm/stream` waterfall, this plugin supplies the missing tool result to the outgoing request in `repair.ts`'s own synthetic shape, so the session is usable again \u2014 without writing a synthetic result into a log whose package-owned runtime invariant forbids exactly that write. Source: discussion #7129. Compatible with the dsh 0.1.2, 0.1.3, 0.1.5 and 0.1.6 prerelease lines.",
   "version": "0.1.0",
   "type": "module",
   "main": "lib/index.js",
@@ -57,6 +57,7 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-llm": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-llm-deepseek": "^0.1.6-alpha.2",
     "@deepseek-ai/dsh-session": "0.1.6-alpha.2",
     "@types/node": "^22.10.2",
     "semver": "^7.6.0",
@@ -66,6 +67,7 @@
     "build": "tsc",
     "pretest": "tsc",
     "prepublishOnly": "tsc",
-    "test": "node --test \"test/*.spec.mjs\""
+    "test": "node --test \"test/*.spec.mjs\"",
+    "probe:serializer": "node scripts/probe-real-serializer.mjs"
   }
 }
