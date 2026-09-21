@@ -142,6 +142,22 @@ asserted twice: unguarded it is refused with zero calls made, guarded the same
 transcript is built and dispatched, and the captured body is checked to answer
 the call in the very next wire message.
 
+It also covers the other shipped protocol, where the evidence has to be different.
+The chat-completions serializer performs **no** pairing check, so nothing local
+refuses the request: the probe confirms the poisoned transcript is built and
+dispatched (one fetch call, against zero on the messages protocol), and that the
+captured body carries an assistant `tool_calls` followed by a `role: 'user'`
+message — the shape a chat-completions provider rejects with 400. Guarded, the
+same body answers each `tool_call_id` with a `role: 'tool'` message immediately
+after the assistant turn, which is that provider's stated requirement.
+
+The dangling call in that arm sits **inside an already-closed turn with later
+turns after it**, the shape a crash-tail repair cannot reach: the probe derives
+the transcript from a log whose `tool/call`, `step/end` and `turn/end` events all
+project to no surface message, so `interruptedTurnClosers` would see a balanced
+log and emit nothing. Because the guard correlates over assistant blocks rather
+than over log events, a closed turn is not a special case for it.
+
 ## License
 
 MIT

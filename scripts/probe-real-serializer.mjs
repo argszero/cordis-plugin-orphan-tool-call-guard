@@ -54,11 +54,24 @@ const connection = resolveAdapterOptions({
   thinking: 'disabled',
 })
 
-const MODEL = connection.models[0].id
+/**
+ * The same adapter over the other shipped protocol. #7386 reports the failure
+ * from the chat-completions hop, where the serializer performs NO pairing check
+ * — so the request is built and dispatched, and only the provider refuses it.
+ * That makes this arm's evidence the captured wire body rather than a throw.
+ */
+const chatConnection = resolveAdapterOptions({
+  protocol: 'chat-completions',
+  baseURL: 'https://probe.invalid/v1',
+  thinking: 'disabled',
+})
 
-function makeAdapter() {
+const MODEL = connection.models[0].id
+const CHAT_MODEL = chatConnection.models[0].id
+
+function makeAdapter(chat = false) {
   return new DeepSeekAdapter({
-    options: () => connection,
+    options: () => chat ? chatConnection : connection,
     resolveApiKey: async () => 'probe-key-not-a-secret',
     resolveUserId: () => 'probe-user',
     prepareExtensions: async () => ({ fields: {}, accept: async () => {} }),
@@ -66,10 +79,10 @@ function makeAdapter() {
 }
 
 /** Drive one request through the real adapter; report the outcome and whether the wire was reached. */
-async function send(options) {
+async function send(options, chat = false) {
   calls = []
   try {
-    for await (const _chunk of makeAdapter().stream(options)) void _chunk
+    for await (const _chunk of makeAdapter(chat).stream(options)) void _chunk
     return { outcome: 'stream-completed', code: undefined, message: undefined, calls: [...calls] }
   } catch (error) {
     return { outcome: 'threw', code: error?.code, message: error?.message, calls: [...calls] }
@@ -195,6 +208,78 @@ for (const [name, messages] of Object.entries(SHAPES)) {
     check(`[${name}] the synthetic result carries the outcome-unknown text`, record.wire.carriesUnknownText)
     check(`[${name}] no tool_use is left unanswered`, wire.every((entry, index) => entry.content.every(block => block.type !== 'tool_use' || wire[index + 1]?.content.some(other => other.type === 'tool_result' && other.tool_use_id === block.id))))
   }
+}
+
+/* Closed-turn arm — #7386's shape: the dangler sits in an already-closed turn
+ * with later turns after it, which is where a crash-tail repair stops looking.
+ * The report's excerpt is exactly this: seq 3816 `tool/call`, seq 3818
+ * `turn/end` error, then turns 4-5, and only much later the failing request. */
+
+const closedTurnLog = [
+  { type: 'user/message', seq: 16, time: 0, data: user('u1', 'read the file') },
+  { type: 'assistant/message', seq: 17, time: 0, data: { turn: 1, step: 1, message: assistantCall('a1', 'call_1') } },
+  { type: 'tool/call', seq: 18, time: 0, data: { turn: 1, step: 1 } },
+  { type: 'step/end', seq: 19, time: 0, data: { turn: 1, step: 1 } },
+  { type: 'turn/end', seq: 20, time: 0, data: { turn: 1, reason: { kind: 'error' } } },
+  { type: 'user/message', seq: 21, time: 0, data: user('u2', 'what happened?') },
+]
+
+const closedSurface = closedTurnLog.map(event => deriveEventMessage(event)).filter(message => message !== null)
+
+report.closedTurn = {
+  logEvents: closedTurnLog.length,
+  surfacedMessages: closedSurface.length,
+  surfacedTypes: closedSurface.map(message => message.role),
+  boundariesAreTrace: closedTurnLog.filter(event => ['tool/call', 'step/end', 'turn/end'].includes(event.type)).every(event => deriveEventMessage(event) === null),
+}
+check('[closed turn] the log is balanced — every boundary event derives no surface message', report.closedTurn.boundariesAreTrace)
+const poisonedAt = closedSurface.findIndex(message => message.role === 'assistant' && message.content.some(block => block.type === 'tool-call'))
+check('[closed turn] a closed turn still surfaces its poisoned assistant message', poisonedAt !== -1)
+check('[closed turn] a later turn follows the dangler — it is mid-history, not the tail', poisonedAt !== -1 && closedSurface.length > poisonedAt + 1)
+
+const closedGuard = guard(request(closedSurface), { mode: 'repair', maxRepairs: 64 }, () => {})
+report.closedTurn.repaired = closedGuard.outcome.repaired
+check('[closed turn] the guard repairs a dangler inside a closed turn', closedGuard.outcome.repaired === true)
+
+/* chat-completions arm — #7386's hop. This serializer performs no pairing
+ * check, so nothing local refuses the request and the evidence has to be the
+ * captured wire body. The provider's own criterion, quoted from the report:
+ * "An assistant message with 'tool_calls' must be followed by tool messages
+ * responding to each 'tool_call_id'." */
+
+function ccPairing(body) {
+  const messages = JSON.parse(body).messages
+  const at = messages.findIndex(entry => Array.isArray(entry.tool_calls) && entry.tool_calls.some(call => call.id === 'call_1'))
+  const next = at === -1 ? undefined : messages[at + 1]
+  return {
+    messages,
+    at,
+    declaredCalls: at === -1 ? [] : messages[at].tool_calls.map(call => call.id),
+    nextRole: next?.role,
+    answersImmediately: next?.role === 'tool' && next?.tool_call_id === 'call_1',
+  }
+}
+
+const ccRequest = messages => ({ provider: 'deepseek-official', model: CHAT_MODEL, messages })
+const ccPoisoned = await send(ccRequest(closedSurface), true)
+report.chatCompletions = {
+  poisoned: { outcome: ccPoisoned.outcome, code: ccPoisoned.code, fetchCalls: ccPoisoned.calls.length },
+}
+check('[chat] the local serializer does NOT catch the dangler (unlike the messages protocol)', ccPoisoned.calls.length === 1, `${ccPoisoned.calls.length} fetch call(s)`)
+
+if (ccPoisoned.calls.length === 1) {
+  const body = ccPairing(ccPoisoned.calls[0].body)
+  report.chatCompletions.poisonedWire = { url: ccPoisoned.calls[0].url, declaredCalls: body.declaredCalls, nextRole: body.nextRole, answersImmediately: body.answersImmediately, messageCount: body.messages.length }
+  check('[chat] the unguarded wire body violates the provider contract the report quotes', body.answersImmediately === false, `next role ${body.nextRole}`)
+}
+
+const ccRepaired = await send(ccRequest(closedGuard.replacement.messages), true)
+report.chatCompletions.repaired = { outcome: ccRepaired.outcome, code: ccRepaired.code, fetchCalls: ccRepaired.calls.length }
+if (ccRepaired.calls.length === 1) {
+  const body = ccPairing(ccRepaired.calls[0].body)
+  report.chatCompletions.repairedWire = { url: ccRepaired.calls[0].url, declaredCalls: body.declaredCalls, nextRole: body.nextRole, answersImmediately: body.answersImmediately, messageCount: body.messages.length }
+  check('[chat] the guarded wire body answers the call immediately', body.answersImmediately === true, `next role ${body.nextRole}`)
+  check('[chat] the guarded body still carries the declared call — answered, not dropped', body.declaredCalls.includes('call_1'))
 }
 
 /* Control arm — a healthy transcript must not be touched, and must still ship. */
