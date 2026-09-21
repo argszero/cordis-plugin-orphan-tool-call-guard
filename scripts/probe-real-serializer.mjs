@@ -25,6 +25,7 @@
  */
 import { guard, findOrphanCalls, OUTCOME_UNKNOWN_TEXT } from '../lib/index.js'
 import { DeepSeekAdapter, resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek'
+import { deriveEventMessage } from '@deepseek-ai/dsh-session'
 
 const failures = []
 let checks = 0
@@ -93,6 +94,28 @@ const toolResult = (id, callId) => ({
 const request = messages => ({ provider: 'deepseek-official', model: MODEL, messages })
 
 /**
+ * The poisoned assistant message as the surface really derives it: the report's
+ * seq 17 `assistant/message`, reconstructed as a log event and run through the
+ * shipped `deriveEventMessage`. Its sibling `tool/call` at seq 18 is trace data.
+ *
+ * Deriving it rather than hand-writing it is the point — the claim under test is
+ * about the transcript the loop really sends, so the fixture has to be the one
+ * the harness produces, not a lookalike. Note this also covers the report's
+ * second shape for free: calls that never reached the scheduler have no
+ * `tool/call` event at all, but they are still blocks in this same message.
+ */
+function derivedPoison() {
+  return deriveEventMessage({
+    type: 'assistant/message',
+    seq: 17,
+    time: 0,
+    data: { turn: 1, step: 1, message: assistantCall('a1', 'call_1') },
+  })
+}
+
+const traceOnlyCall = deriveEventMessage({ type: 'tool/call', seq: 18, time: 0, data: { turn: 1, step: 1 } })
+
+/**
  * The two shapes the serializer partitions separately: an orphan followed by a
  * later turn, and an orphan the history ends on. They throw from different
  * lines, and one repair shape has to satisfy both.
@@ -100,12 +123,12 @@ const request = messages => ({ provider: 'deepseek-official', model: MODEL, mess
 const SHAPES = {
   'mid-history-unpaired': [
     user('u1', 'read the file'),
-    assistantCall('a1', 'call_1'),
+    derivedPoison(),
     user('u2', 'what happened?'),
   ],
   'history-ends-unpaired': [
     user('u1', 'read the file'),
-    assistantCall('a1', 'call_1'),
+    derivedPoison(),
   ],
 }
 
@@ -119,6 +142,23 @@ function pairing(body) {
 /* -------------------------------------------------------------------- arms */
 
 const report = { model: MODEL, shapes: {}, control: {}, observe: {} }
+
+/* The fixture must be the harness's own derivation, and the report's claim that
+ * `tool/call` is trace rather than surface must hold — both are load-bearing for
+ * reading the arms below. */
+
+const sample = derivedPoison()
+report.fixture = {
+  derivedIsMessage: sample !== null,
+  carriesToolCall: sample?.content?.some(block => block.type === 'tool-call' && block.id === 'call_1') === true,
+  traceOnlyCallIsNotSurface: traceOnlyCall === null,
+}
+check('[fixture] the poisoned assistant message is the surface\'s own derivation', report.fixture.derivedIsMessage && report.fixture.carriesToolCall)
+check('[fixture] a tool/call event derives no surface message', report.fixture.traceOnlyCallIsNotSurface)
+
+// The synthetic text must be repair.ts's own wording, not a paraphrase of it.
+report.wording = { length: OUTCOME_UNKNOWN_TEXT.length, beginsWith: OUTCOME_UNKNOWN_TEXT.slice(0, 40) }
+check('[fixture] the synthetic text is non-empty canonical wording', OUTCOME_UNKNOWN_TEXT.length === 313, `${OUTCOME_UNKNOWN_TEXT.length} chars`)
 
 for (const [name, messages] of Object.entries(SHAPES)) {
   const record = {}
