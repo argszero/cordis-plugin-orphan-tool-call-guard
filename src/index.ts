@@ -41,9 +41,13 @@
  * replacement this plugin re-dispatches is a different object and therefore
  * never claims to be a loop-built request.
  *
- * The repair is `repair.ts`'s synthetic result in `repair.ts`'s own words: one
- * user-role tool-result message per orphan, inserted directly after the
- * assistant message that declared it, marked `isError`. That the outcome is
+ * The repair is `repair.ts`'s synthetic result in `repair.ts`'s own words,
+ * inserted directly after the assistant message that declared it and marked
+ * `isError`. Its *shape* follows the line: a `tool-result` content block inside a
+ * user-role message on the 0.1.x lines, where that is the container a result
+ * lives in, and a first-class `role: 'tool'` message from `0.2.1-rc.1` on, where
+ * the older container is a hard admission refusal and so could not carry a
+ * repair at all. That the outcome is
  * unknown is a fact about the log — it cannot distinguish a call that never
  * reached a tool from one that ran and lost its result — so the text tells the
  * model to decide from the tool's semantics and never to retry blindly. Nothing
@@ -56,7 +60,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { MessageId, freezeMessage } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, Message, StreamChunk, ToolCallId } from '@deepseek-ai/dsh-llm'
+import * as llmRuntime from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, GenerateOptions, Message, StreamChunk, ToolCallId } from '@deepseek-ai/dsh-llm'
 
 /** This plugin's id: its bundle row and the prefix of its log lines. */
 export const name = 'orphan-tool-call-guard'
@@ -97,6 +102,21 @@ export const Config: z<Config> = z.object({
  */
 export const OUTCOME_UNKNOWN_TEXT = 'The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly.'
 
+/**
+ * The part of a message this guard reads.
+ *
+ * Structural on purpose. `GenerateOptions.messages` is `Message[]` on the 0.1.x
+ * lines and `RequestMessage[]` (`Message | RequestUserInput`) from
+ * `0.2.1-rc.1` on, and this guard must compile and behave on both without naming
+ * a type only one of them has.
+ */
+export interface WalkableMessage {
+  readonly role: string
+  readonly content: readonly ContentBlock[]
+  /** Present on a first-class tool result (`0.2.1-rc.1`+). */
+  readonly toolCallId?: string
+}
+
 /** One recorded tool call the transcript never answered. */
 export interface OrphanCall {
   /** The call id the assistant message declared and no result answers. */
@@ -107,10 +127,54 @@ export interface OrphanCall {
   readonly messageIndex: number
 }
 
-/** Whether one message is the tool result for `callId`. */
-function answers(message: Message, callId: ToolCallId): boolean {
-  return message.content.some(block => block.type === 'tool-result' && block.toolCallId === callId)
+/**
+ * Every call id one message answers, whatever shape this line spells them in.
+ *
+ * Two shapes exist and both must be read, because the guard runs on a line whose
+ * vocabulary it does not control:
+ *
+ * - a `tool-result` **content block** carrying `toolCallId`, inside a user-role
+ *   message — the 0.1.x shape;
+ * - a **message-level** `toolCallId`, on a first-class `role: 'tool'` message —
+ *   the shape from `0.2.1-rc.1` on.
+ *
+ * Read structurally for the same reason `tool-result` is not named here: the
+ * block vocabulary is merge-extensible, so a block carrying a `toolCallId` is an
+ * answer whatever its tag says.
+ * @param message - one message of the request.
+ * @returns the call ids it answers, possibly none.
+ */
+function answeredBy(message: WalkableMessage): readonly ToolCallId[] {
+  const ids: ToolCallId[] = []
+  const top: unknown = (message as { toolCallId?: unknown }).toolCallId
+  if (typeof top === 'string') ids.push(top as ToolCallId)
+  for (const block of message.content) {
+    const nested: unknown = (block as { toolCallId?: unknown }).toolCallId
+    if (typeof nested === 'string') ids.push(nested as ToolCallId)
+  }
+  return ids
 }
+
+/**
+ * Whether this line's tool results are first-class `role: 'tool'` messages.
+ *
+ * Probed from the constructor rather than from a version string, and from what
+ * the constructor *produces* rather than from whether it exists: it exists on
+ * every line this package declares, but it builds the older user-role container
+ * on the 0.1.x lines and a `role: 'tool'` message from `0.2.1-rc.1` on. The
+ * shape is what matters, because a request can only carry the vocabulary its own
+ * line admits.
+ */
+const RESULTS_ARE_MESSAGES: boolean = (() => {
+  const build: unknown = (llmRuntime as Record<string, unknown>).createToolResultMessage
+  if (typeof build !== 'function') return false
+  try {
+    const probe = (build as (input: unknown) => { role?: unknown })({ callId: 'shape-probe', content: [], isError: false })
+    return probe.role === 'tool'
+  } catch {
+    return false
+  }
+})()
 
 /**
  * Find every call the transcript declares but never answers.
@@ -123,12 +187,10 @@ function answers(message: Message, callId: ToolCallId): boolean {
  * @param messages - the model-visible message list, in order.
  * @returns the orphans in transcript order, empty when every call is answered.
  */
-export function findOrphanCalls(messages: readonly Message[]): readonly OrphanCall[] {
+export function findOrphanCalls(messages: readonly WalkableMessage[]): readonly OrphanCall[] {
   const answered = new Set<ToolCallId>()
   for (const message of messages) {
-    for (const block of message.content) {
-      if (block.type === 'tool-result') answered.add(block.toolCallId)
-    }
+    for (const callId of answeredBy(message)) answered.add(callId)
   }
   const orphans: OrphanCall[] = []
   for (const [messageIndex, message] of messages.entries()) {
@@ -142,14 +204,46 @@ export function findOrphanCalls(messages: readonly Message[]): readonly OrphanCa
 }
 
 /**
- * Build the synthetic result for one orphan, in `repair.ts`'s shape: a
- * user-role message whose single block is the error result for `callId`. The id
- * is derived from the call rather than random, so re-deriving the same repair
- * produces the same message identity on every request.
+ * Build the synthetic result for one orphan in the shape this line admits.
+ *
+ * The wording is `repair.ts`'s, so a transcript repaired here reads exactly like
+ * one repaired by the crash path. The *container* is the line's, and that
+ * distinction is the whole point: a `tool-result` content block in interpreted
+ * content is a hard admission refusal from `0.2.1-rc.1` on (the durable
+ * vocabulary there spells a result as a `role: 'tool'` message), so building the
+ * older container on that line would answer the orphan by making the request
+ * unsendable — a repair that fails in the same breath.
+ *
  * @param callId - the call the result answers.
+ * @param shape - which container to build; defaults to the installed line's, and
+ *   is spelled out by tests so both arms are pinned wherever they can run.
  * @returns the frozen synthetic tool-result message.
  */
-export function syntheticToolResult(callId: ToolCallId): Message {
+export function syntheticToolResult(
+  callId: ToolCallId,
+  shape: 'message' | 'container' = RESULTS_ARE_MESSAGES ? 'message' : 'container',
+): Message {
+  const content = [{ type: 'text', text: OUTCOME_UNKNOWN_TEXT }] as const
+  if (shape === 'message') {
+    // Built by the line's own constructor so identity, freezing, `source` and
+    // the message-level `toolCallId` are the runtime's decisions, not a copy of
+    // them that could drift.
+    const build = (llmRuntime as Record<string, unknown>).createToolResultMessage as
+      | ((input: { callId: ToolCallId; content: readonly unknown[]; isError: boolean }) => Message)
+      | undefined
+    if (build !== undefined) {
+      // The constructor mints a fresh identity per call, and this repair is
+      // re-derived on *every* request, so a random id would make each request's
+      // repaired transcript differ from the last. The id is therefore re-derived
+      // from the call, which is the property this plugin documents: the same
+      // orphan produces the same message identity every time.
+      const built = build({ callId, content, isError: true })
+      return freezeMessage({ ...built, id: MessageId(`orphan-tool-result-${callId}`) })
+    }
+  }
+  // Reachable only on a line that still spells a result this way: the block type
+  // is gone from the union from `0.2.1-rc.1` on, so the cast documents which
+  // lines this branch can run on rather than pretending the type exists.
   return freezeMessage({
     id: MessageId(`orphan-tool-result-${callId}`),
     role: 'user',
@@ -160,7 +254,7 @@ export function syntheticToolResult(callId: ToolCallId): Message {
       isError: true,
       content: [{ type: 'text', text: OUTCOME_UNKNOWN_TEXT }],
     }],
-  })
+  } as unknown as Message)
 }
 
 /**
@@ -174,20 +268,20 @@ export function syntheticToolResult(callId: ToolCallId): Message {
  * @param orphans - the orphans to answer, as {@link findOrphanCalls} returned them.
  * @returns a new list with one synthetic result per orphan.
  */
-export function answerOrphans(
-  messages: readonly Message[],
+export function answerOrphans<T extends WalkableMessage>(
+  messages: readonly T[],
   orphans: readonly OrphanCall[],
-): readonly Message[] {
+): readonly T[] {
   const byMessage = new Map<number, OrphanCall[]>()
   for (const orphan of orphans) {
     const group = byMessage.get(orphan.messageIndex)
     if (group === undefined) byMessage.set(orphan.messageIndex, [orphan])
     else group.push(orphan)
   }
-  const repaired: Message[] = []
+  const repaired: T[] = []
   for (const [index, message] of messages.entries()) {
     repaired.push(message)
-    for (const orphan of byMessage.get(index) ?? []) repaired.push(syntheticToolResult(orphan.callId))
+    for (const orphan of byMessage.get(index) ?? []) repaired.push(syntheticToolResult(orphan.callId) as unknown as T)
   }
   return repaired
 }

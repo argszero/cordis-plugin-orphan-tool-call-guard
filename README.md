@@ -21,10 +21,15 @@ Mounted, this plugin supplies the missing result to the outgoing request:
 ```
 input:  user        "delete the stale branch"
         assistant   tool_calls: [git_branch(delete) id=call-1]
-        user        tool_result: [error] "The tool call was interrupted after it was
-                    recorded, but no result was durably recorded. Its outcome is
-                    unknown. Decide whether to retry from the tool semantics..."
+        tool        toolCallId: call-1  [error] "The tool call was interrupted after
+                    it was recorded, but no result was durably recorded. Its outcome
+                    is unknown. Decide whether to retry from the tool semantics..."
 ```
+
+The fourth line is the shape from `0.2.1-rc.1` on, where a tool result is a
+message of its own. On the 0.1.x lines the same text travels as a `tool-result`
+content block inside a user-role message, because that is the only container a
+result has there. The guard builds whichever shape the installed line admits.
 
 The replacement is re-derived on every later request, so the session stays usable
 from then on. Nothing is written to the session log.
@@ -51,11 +56,25 @@ breaker for a transcript that is not worth a partial repair.
 ## What it does, precisely
 
 The plugin listens on the documented `llm/stream` waterfall. For each outgoing
-request it looks for tool calls no `tool-result` block answers, and for each one
-inserts a synthetic result — the exact message shape and wording
-`@deepseek-ai/dsh-session`'s `repair.ts` uses for a crash-interrupted turn —
-directly after the assistant message that declared it. If there is nothing to
-answer, the request is passed through untouched and nothing is logged.
+request it collects every call id the transcript answers — a message-level
+`toolCallId` on a first-class `role: 'tool'` message, or a nested one on a
+`tool-result` content block — and treats every assistant `tool-call` block whose
+id is in neither set as an orphan. Detection reads the vocabulary structurally
+rather than assuming one spelling: from `0.2.1-rc.1` on a `tool-result` block is
+no longer how a result is spelled, so a set collected from blocks alone stays
+empty there and every already-answered call would look like a poison.
+
+Each orphan gets one synthetic result, inserted directly after the assistant
+message that declared it, in the wording `@deepseek-ai/dsh-session`'s `repair.ts`
+uses for a crash-interrupted turn. The *container* follows the installed line:
+the line's own `createToolResultMessage`, which builds a `role: 'tool'` message
+where that is the admitted shape and the user-role container before it. Which
+shape applies is decided by building one and reading its role — not by a version
+string, and not by whether the constructor exists, because it exists on every
+line this package declares. The synthetic message's id is re-derived from the
+call id, so the same orphan keeps the same identity on every request instead of
+minting a new one each time. If there is nothing to answer, the request is
+passed through untouched and nothing is logged.
 
 ## What it does not do, and why
 
@@ -99,12 +118,32 @@ arguments.
 
 ## Compatibility
 
-| dsh line | `@deepseek-ai/dsh-llm` |
-| --- | --- |
-| 0.1.2 prereleases | `0.1.2-rc.1` |
-| 0.1.3 prereleases | `0.1.3-alpha.2` |
-| 0.1.5 prereleases | `0.1.5-rc.2` |
-| 0.1.6 prereleases | `0.1.6-alpha.2` |
+| dsh line | `@deepseek-ai/dsh-llm` measured | suite |
+| --- | --- | --- |
+| 0.1.2 prereleases | `0.1.2-rc.1` | 36 / 36 |
+| 0.1.3 prereleases | `0.1.3-alpha.2` | 36 / 36 |
+| 0.1.5 prereleases | `0.1.5-alpha.1` | 36 / 36 |
+| 0.1.6 prereleases | `0.1.6-alpha.1` | 36 / 36 |
+| 0.2.1 prereleases | `0.2.1-rc.1`, `rc.2`, `rc.3` | 35 pass, 1 self-skipped |
+
+Each row is a separate install of that line's published packages with this
+repository's `test/` copied in; the counts are what `node --test` printed against
+that install, not an intention. The peer range admits those lines and nothing
+outside them.
+
+**The 0.2.1 skip is a stated capability gap, not a failure.** One test drives a
+repaired stream through the shipped session invariant, whose home on the older
+lines is `@deepseek-ai/dsh-session/invariant`. `@deepseek-ai/dsh-llm` does not
+export `./invariant` on the 0.2.1 line, and `@deepseek-ai/dsh-invariants` is
+published only up to `0.2.0-rc.2` — no artifact of that line can state the rule,
+so the test reports `SKIP` with that reason rather than passing quietly.
+
+**From `0.2.1-rc.1` on, a tool result is a message, not a block.** There a result
+is a first-class `role: 'tool'` message carrying a message-level `toolCallId`, and
+a `tool-result` *content block* in an interpreted slot is refused at admission.
+The guard detects answers in both vocabularies and builds its synthetic result in
+the one the installed line admits, so this single package repairs both — and on
+the newer line it never puts a `tool-result` block on the wire, which is asserted.
 
 The plugin needs the `llm/stream` waterfall, `GenerateOptions.sessionId`, and the
 `llm` service — all present across those lines. `@deepseek-ai/cordis` is a peer
@@ -122,7 +161,23 @@ stand-in is the provider backend, because a test cannot call a provider — and 
 enforces the one rule the repair exists for. The control test (plugin unmounted)
 proves the fixture really is refused, the synthetic message is checked against
 `interruptedTurnClosers()` rather than a copy of its wording, and the last test
-runs the repaired stream through the shipped `@deepseek-ai/dsh-llm/invariant`.
+runs the repaired stream through the shipped session invariant.
+
+The suite carries shape-neutral arms, because the vocabulary moves under it:
+detection is asserted against both spellings wherever the line can produce them,
+the built container is pinned per line, and on a line whose results are messages a
+repaired request is asserted to carry **no** `tool-result` block — exactly the
+block the previous synthesis would have produced, and the one the newer line
+refuses. On the older lines that block *is* the container, so the assertion does
+not apply and does not run.
+
+`test/packaging.spec.mjs` guards the artifact rather than the behaviour, since
+every one of its failures is silent: the built `lib/` must not be hidden by any
+ignore file (`.gitignore` and `.npmignore` are each checked when present, because
+a copy of the tree may carry neither), the file list must carry the entry point,
+the declarations and the mount patch, that patch must register
+`id: orphan-tool-call-guard` and name this package, and every bare import in the
+shipped code must be declared for a consumer rather than only for this checkout.
 
 ### Against the provider's own serializer
 

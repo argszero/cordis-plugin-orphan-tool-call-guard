@@ -59,8 +59,14 @@ import {
 function danglingCalls(messages) {
   const answered = new Set()
   for (const message of messages) {
+    // Both shapes a result is spelled in: a message-level `toolCallId` on a
+    // first-class `role: 'tool'` message (0.2.1-rc.1+), or a `tool-result` block
+    // carrying one inside a user-role message (0.1.x). A provider applies the
+    // rule to whatever the request carries, so the stand-in must too — a stub
+    // that only knows one shape reports a correct repair as dangling.
+    if (typeof message.toolCallId === 'string') answered.add(message.toolCallId)
     for (const block of message.content) {
-      if (block.type === 'tool-result') answered.add(block.toolCallId)
+      if (typeof block.toolCallId === 'string') answered.add(block.toolCallId)
     }
   }
   const dangling = []
@@ -156,6 +162,15 @@ function assistant(...ids) {
   })
 }
 
+/**
+ * The call a message answers, whichever shape this line spells results in.
+ * @param message - a result message, real or synthetic.
+ * @returns its call id, or `undefined` when it answers nothing.
+ */
+function answeredCallId(message) {
+  return message.toolCallId ?? message.content[0]?.toolCallId
+}
+
 /** One real (answered) tool result. */
 function result(callId, text = 'contents') {
   return createToolResultMessage({ callId, content: [{ type: 'text', text }], isError: false })
@@ -192,13 +207,17 @@ test('the synthetic result is the one the shipped crash-repair path produces', (
 
   const shipped = closer.data.message
   const ours = syntheticToolResult(X)
-  assert.equal(ours.role, shipped.role)
+  // The agreement this test exists for is the *wording and the correlation*, so
+  // both are read where the installed line puts them: inside the `tool-result`
+  // container on the 0.1.x lines, on the message's own text block from
+  // 0.2.1-rc.1 on, where a result is a `role: 'tool'` message.
+  const textOf = message => message.content[0]?.content?.[0]?.text ?? message.content[0]?.text
+  assert.equal(ours.role, shipped.role, 'the repair is built in the shape this line uses')
   assert.equal(ours.source.kind, shipped.source.kind)
   assert.equal(ours.source.callId, shipped.source.callId)
-  assert.equal(ours.content[0].content[0].text, shipped.content[0].content[0].text)
-  assert.equal(OUTCOME_UNKNOWN_TEXT, shipped.content[0].content[0].text)
-  assert.equal(ours.content[0].isError, true)
-  assert.equal(ours.content[0].toolCallId, X)
+  assert.equal(OUTCOME_UNKNOWN_TEXT, textOf(shipped))
+  assert.equal(textOf(ours), textOf(shipped))
+  assert.equal(answeredCallId(ours), X)
 })
 
 test('the synthetic result is immutable and named after the call it answers', () => {
@@ -210,6 +229,93 @@ test('the synthetic result is immutable and named after the call it answers', ()
 })
 
 // ------------------------------------------------------------- finding them
+
+// ------------------------------------------------- both shapes of a result
+
+/**
+ * Whether this line spells a tool result as a first-class message.
+ *
+ * Probed from the plugin's own default, so the arms below assert the behaviour
+ * of the line they run on instead of hard-coding one of the two lines' shape.
+ */
+const RESULTS_ARE_MESSAGES = syntheticToolResult(X).role === 'tool'
+
+/** The role a repaired result takes on this line: `tool` or the older `user`. */
+const RESULT_ROLE = RESULTS_ARE_MESSAGES ? 'tool' : 'user'
+
+test('a call is answered by either shape of result, whatever this line spells', () => {
+  // A transcript may be read on a line that spells results the other way — the
+  // guard reads the request it is handed, not the vocabulary it prefers — so
+  // both shapes must settle a call. A scan that only knew one would count every
+  // answered call as an orphan and answer it a second time.
+  const asContainer = {
+    id: 'r-container',
+    role: 'user',
+    source: { kind: 'tool', callId: X },
+    content: [{ type: 'tool-result', toolCallId: X, isError: false, content: [{ type: 'text', text: 't' }] }],
+  }
+  const asMessage = {
+    id: 'r-message',
+    role: 'tool',
+    source: { kind: 'tool', callId: X },
+    toolCallId: X,
+    content: [{ type: 'text', text: 't' }],
+  }
+  assert.deepEqual(findOrphanCalls([user('hi'), assistant(X), asContainer]), [], 'the container shape answers')
+  assert.deepEqual(findOrphanCalls([user('hi'), assistant(X), asMessage]), [], 'the message shape answers')
+})
+
+test('an unknown block that carries a toolCallId still answers its call', () => {
+  // The block vocabulary is merge-extensible, so the scan reads the correlation
+  // rather than the tag: anything carrying the call id is that call's answer.
+  const future = { id: 'r-future', role: 'user', source: { kind: 'tool', callId: X }, content: [{ type: 'future-result', toolCallId: X }] }
+  assert.deepEqual(findOrphanCalls([user('hi'), assistant(X), future]), [])
+})
+
+test('the synthetic result is built in the shape this line admits', () => {
+  // Spelled explicitly, so both arms are pinned wherever they can run. Which
+  // arms *can* run is a property of the line: the message shape is built by the
+  // line's own constructor, so on a line whose constructor only knows the older
+  // container there is no tool-role message to assert — and this test says so
+  // rather than asserting a shape that line cannot produce.
+  const asMessage = syntheticToolResult(X, 'message')
+  if (RESULTS_ARE_MESSAGES) {
+    assert.equal(asMessage.role, 'tool')
+    assert.equal(asMessage.toolCallId, X)
+    assert.equal(asMessage.content[0].text, OUTCOME_UNKNOWN_TEXT)
+    assert.ok(Object.isFrozen(asMessage))
+  } else {
+    assert.equal(asMessage.role, 'user', 'this line has no tool-role message; its constructor is the only shape')
+  }
+
+  const asContainer = syntheticToolResult(X, 'container')
+  assert.equal(asContainer.role, 'user')
+  assert.equal(asContainer.content[0].type, 'tool-result')
+  assert.equal(asContainer.content[0].toolCallId, X)
+  assert.equal(asContainer.content[0].content[0].text, OUTCOME_UNKNOWN_TEXT)
+})
+
+test('the default repair is the shape this line uses, and answers the call', () => {
+  const message = syntheticToolResult(X)
+  assert.equal(message.role, RESULTS_ARE_MESSAGES ? 'tool' : 'user')
+  assert.equal(answeredCallId(message), X)
+})
+
+test('a repaired request on a tool-message line carries no retired tool-result block', () => {
+  // The decisive arm for 0.2.1-rc.1 and on: a `tool-result` content block in
+  // interpreted content is a hard admission refusal there, so a repair built in
+  // the older container would answer the orphan by making the request
+  // unsendable. The repair must arrive as a message, and the request must hold
+  // no block of the retired type.
+  if (!RESULTS_ARE_MESSAGES) return
+  const repaired = answerOrphans(POISONED, findOrphanCalls(POISONED))
+  const blocks = repaired.flatMap(message => message.content.map(block => block.type))
+  assert.ok(!blocks.includes('tool-result'), `no retired block may survive a repair, saw ${blocks.join(',')}`)
+  const repairedResult = repaired[repaired.length - 1]
+  assert.equal(repairedResult.role, 'tool')
+  assert.equal(repairedResult.toolCallId, X)
+  assert.equal(repairedResult.isError, true)
+})
 
 test('a fully answered transcript has no orphans', () => {
   assert.deepEqual(findOrphanCalls([user('hi'), assistant(X), result(X)]), [])
@@ -248,10 +354,11 @@ test('each result is inserted directly after the message that declared it', () =
   const messages = [user('a'), assistant(X), result(X), user('b'), assistant(Y), user('c')]
   const repaired = answerOrphans(messages, findOrphanCalls(messages))
   assert.equal(repaired.length, messages.length + 1)
-  assert.deepEqual(repaired.map(m => m.content[0].type), [
-    'text', 'tool-call', 'tool-result', 'text', 'tool-call', 'tool-result', 'text',
+  assert.deepEqual(repaired.map(m => m.role), [
+    'user', 'assistant', RESULT_ROLE, 'user', 'assistant', RESULT_ROLE, 'user',
   ])
-  assert.equal(repaired[5].content[0].toolCallId, Y)
+  assert.equal(answeredCallId(repaired[2]), X, 'the real result answers its own call')
+  assert.equal(answeredCallId(repaired[5]), Y, 'the synthetic one answers the call it was built for')
   // The list is rebuilt, never mutated in place: a loop-built request carries a
   // frozen array.
   assert.equal(messages.length, 6)
@@ -261,7 +368,7 @@ test('each result is inserted directly after the message that declared it', () =
 test('sibling calls in one message are answered in declaration order', () => {
   const messages = [assistant(X, Y, Z)]
   const repaired = answerOrphans(messages, findOrphanCalls(messages))
-  assert.deepEqual(repaired.slice(1).map(m => m.content[0].toolCallId), [X, Y, Z])
+  assert.deepEqual(repaired.slice(1).map(answeredCallId), [X, Y, Z])
 })
 
 test('a transcript with no orphans is returned unchanged by the replacer', () => {
@@ -371,11 +478,19 @@ test('the provider is handed a paired transcript and answers normally', async ()
   // and the replacement re-entering the waterfall did not repair itself again.
   assert.equal(adapter.calls.length, 1)
   assert.deepEqual(danglingCalls(adapter.calls[0].messages), [])
-  assert.deepEqual(
-    adapter.calls[0].messages.map(m => m.content[0].type),
-    ['text', 'tool-call', 'tool-result'],
-  )
-  assert.equal(adapter.calls[0].messages[2].content[0].isError, true)
+  assert.deepEqual(adapter.calls[0].messages.map(m => m.role), ['user', 'assistant', RESULT_ROLE])
+  assert.equal(answeredCallId(adapter.calls[0].messages[2]), X)
+  // `isError` rides the message in the newer shape and the block in the older one.
+  const repairedResult = adapter.calls[0].messages[2]
+  assert.equal(repairedResult.isError ?? repairedResult.content[0].isError, true)
+  // Where the line retired the `tool-result` block (0.2.1-rc.1 on), a dispatched
+  // request must hold none: that is the vocabulary rule the repair now respects.
+  // On the older lines the block *is* the container a result lives in, so there
+  // is nothing to assert there.
+  if (RESULTS_ARE_MESSAGES) {
+    const shippedBlocks = adapter.calls[0].messages.flatMap(m => m.content.map(b => b.type))
+    assert.ok(shippedBlocks.every(type => type !== 'tool-result'), 'no retired block in a dispatched request')
+  }
 })
 
 test('a request the loop built keeps its marker and its replacement does not claim one', async () => {
@@ -455,9 +570,27 @@ test('the guard survives a second poisoned request on the same context', async (
 
 // ------------------------------------------------------- the llm invariant
 
-test('the repaired stream satisfies the shipped LLM stream invariant', async () => {
-  const { InvariantRegistry } = await import('@deepseek-ai/dsh-invariants')
-  const llmInvariant = await import('@deepseek-ai/dsh-llm/invariant')
+// Two capabilities have to be present at once, and each can be missing on a
+// declared line — so both are measured rather than assumed. A coverage claim
+// cannot be made from a missing package: when either is absent the test
+// announces the gap instead of reporting a pass it never ran.
+const INVARIANTS = await import('@deepseek-ai/dsh-invariants').then(
+  module => ({ ok: true, module }),
+  error => ({ ok: false, reason: error.code === 'ERR_MODULE_NOT_FOUND'
+    ? 'the invariants package is not published for this line (last published 0.2.0-rc.2, none for 0.2.1)'
+    : error.message }),
+)
+const LLM_INVARIANT = await import('@deepseek-ai/dsh-llm/invariant').then(
+  module => ({ ok: true, module }),
+  error => ({ ok: false, reason: error.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED'
+    ? 'this line no longer exports the `@deepseek-ai/dsh-llm/invariant` subpath'
+    : error.message }),
+)
+const INVARIANT_SKIP = !INVARIANTS.ok ? INVARIANTS.reason : !LLM_INVARIANT.ok ? LLM_INVARIANT.reason : false
+
+test('the repaired stream satisfies the shipped LLM stream invariant', { skip: INVARIANT_SKIP }, async () => {
+  const { InvariantRegistry } = INVARIANTS.module
+  const llmInvariant = LLM_INVARIANT.module
 
   const ctx = new Context()
   await ctx.plugin(InvariantRegistry)
