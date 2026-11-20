@@ -125,18 +125,28 @@ arguments.
 | 0.1.5 prereleases | `0.1.5-alpha.1` | 36 / 36 |
 | 0.1.6 prereleases | `0.1.6-alpha.1` | 36 / 36 |
 | 0.2.1 prereleases | `0.2.1-rc.1`, `rc.2`, `rc.3` | 35 pass, 1 self-skipped |
+| 0.2.2 prereleases | `0.2.2-rc.5` | 35 pass, 1 self-skipped |
 
 Each row is a separate install of that line's published packages with this
 repository's `test/` copied in; the counts are what `node --test` printed against
 that install, not an intention. The peer range admits those lines and nothing
 outside them.
 
-**The 0.2.1 skip is a stated capability gap, not a failure.** One test drives a
+The 0.2.2 row is the one measured in place, because there the line in
+`package.json`'s own devDependencies *is* the line under test: `npm install`
+followed by `npm test` in this repository, 36 tests. A harness that copies only
+the behaviour file into a separate install reports 30 on the same runtime — the
+six-test difference is `test/packaging.spec.mjs`, which asserts the shipped
+artifact rather than the behaviour, and it needs the repository around it.
+
+**The skip is a stated capability gap, not a failure.** One test drives a
 repaired stream through the shipped session invariant, whose home on the older
-lines is `@deepseek-ai/dsh-session/invariant`. `@deepseek-ai/dsh-llm` does not
-export `./invariant` on the 0.2.1 line, and `@deepseek-ai/dsh-invariants` is
-published only up to `0.2.0-rc.2` — no artifact of that line can state the rule,
-so the test reports `SKIP` with that reason rather than passing quietly.
+lines is `@deepseek-ai/dsh-session/invariant`. On both the 0.2.1 and the 0.2.2
+line `@deepseek-ai/dsh-llm` refuses that subpath with
+`ERR_PACKAGE_PATH_NOT_EXPORTED`, and `@deepseek-ai/dsh-invariants` is published
+only up to `0.2.0-rc.2` — no artifact of either line can state the rule, so the
+test reports `SKIP` naming that gap rather than passing quietly. Everything else
+in the suite runs on both.
 
 **From `0.2.1-rc.1` on, a tool result is a message, not a block.** There a result
 is a first-class `role: 'tool'` message carrying a message-level `toolCallId`, and
@@ -205,6 +215,16 @@ captured body carries an assistant `tool_calls` followed by a `role: 'user'`
 message — the shape a chat-completions provider rejects with 400. Guarded, the
 same body answers each `tool_call_id` with a `role: 'tool'` message immediately
 after the assistant turn, which is that provider's stated requirement.
+
+**On the 0.2.2 line that second arm cannot run, and the probe says so.** The line
+removed the protocol: `chat-completions` appears nowhere in the provider, and a
+`protocol` key is refused outright with `llm-deepseek: protocol is not
+configurable; remove it and use a Messages-compatible baseURL` — the protocol is
+derived from the base URL instead. The arm reports `SKIP` with that message
+rather than counting as a pass, so on that line the honest reading is 30 checks,
+0 failures and 1 skip. The adapter's dependency object also changed shape there
+(`resolveAuth`, returning headers, where the older lines took `resolveApiKey`),
+and the probe supplies both so one script measures every declared line.
 
 The dangling call in that arm sits **inside an already-closed turn with later
 turns after it**, the shape a crash-tail repair cannot reach: the probe derives

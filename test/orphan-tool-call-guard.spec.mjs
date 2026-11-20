@@ -577,7 +577,7 @@ test('the guard survives a second poisoned request on the same context', async (
 const INVARIANTS = await import('@deepseek-ai/dsh-invariants').then(
   module => ({ ok: true, module }),
   error => ({ ok: false, reason: error.code === 'ERR_MODULE_NOT_FOUND'
-    ? 'the invariants package is not published for this line (last published 0.2.0-rc.2, none for 0.2.1)'
+    ? 'the invariants package is not published for this line (the newest published artifact is 0.2.0-rc.2)'
     : error.message }),
 )
 const LLM_INVARIANT = await import('@deepseek-ai/dsh-llm/invariant').then(

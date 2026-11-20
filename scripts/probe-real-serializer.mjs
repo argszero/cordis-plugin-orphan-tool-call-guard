@@ -24,11 +24,17 @@
  *   npm install && npm run build && npm run probe:serializer
  */
 import { guard, findOrphanCalls, OUTCOME_UNKNOWN_TEXT } from '../lib/index.js'
+import { createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { DeepSeekAdapter, resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek'
 import { deriveEventMessage } from '@deepseek-ai/dsh-session'
 
 const failures = []
+const skips = []
 let checks = 0
+
+function skip(label, reason) {
+  skips.push(`${label} — ${reason}`)
+}
 
 function check(label, condition, detail) {
   checks += 1
@@ -48,30 +54,69 @@ globalThis.fetch = async (url, init) => {
 
 /* ------------------------------------------------------------------- adapter */
 
-const connection = resolveAdapterOptions({
-  protocol: 'messages',
-  baseURL: 'https://probe.invalid/v1',
-  thinking: 'disabled',
-})
+/**
+ * Resolve one protocol on the *installed* provider line.
+ *
+ * The provider's config surface moved under this probe: from `0.2.2-rc.1` on,
+ * `protocol` is not a configurable key at all (`resolveAdapterOptions` throws
+ * "protocol is not configurable; remove it and use a Messages-compatible
+ * baseURL"), and `chat-completions` is gone from that package. The probe asks
+ * the installed line what it admits instead of asserting the spelling only the
+ * older lines have, and states the gap when a line admits nothing.
+ * @param protocol - the protocol this arm wants.
+ * @returns the resolved connection, or the reason this line refused it.
+ */
+function resolveOnThisLine(protocol) {
+  const base = { baseURL: 'https://probe.invalid/v1', thinking: 'disabled' }
+  try {
+    return { ok: true, connection: resolveAdapterOptions({ ...base, protocol }) }
+  } catch (withProtocol) {
+    if (protocol !== 'messages') return { ok: false, reason: withProtocol.message }
+    // A Messages-only line derives the protocol from the baseURL and rejects
+    // the key that used to select it. Retrying without `protocol` is the same
+    // request on that line, not a weaker one.
+    try {
+      return { ok: true, connection: resolveAdapterOptions(base) }
+    } catch {
+      return { ok: false, reason: withProtocol.message }
+    }
+  }
+}
+
+const messagesLine = resolveOnThisLine('messages')
+if (!messagesLine.ok) throw new Error(`this line admits no Messages connection: ${messagesLine.reason}`)
+const connection = messagesLine.connection
 
 /**
  * The same adapter over the other shipped protocol. #7386 reports the failure
  * from the chat-completions hop, where the serializer performs NO pairing check
  * — so the request is built and dispatched, and only the provider refuses it.
  * That makes this arm's evidence the captured wire body rather than a throw.
+ * A line that no longer ships that protocol has no hop for this arm to measure,
+ * and the probe says so instead of passing quietly.
  */
-const chatConnection = resolveAdapterOptions({
-  protocol: 'chat-completions',
-  baseURL: 'https://probe.invalid/v1',
-  thinking: 'disabled',
-})
+const chatLine = resolveOnThisLine('chat-completions')
 
 const MODEL = connection.models[0].id
-const CHAT_MODEL = chatConnection.models[0].id
+const CHAT_MODEL = chatLine.ok ? chatLine.connection.models[0].id : undefined
 
+/**
+ * Build the adapter against whichever dependency shape the installed line takes.
+ *
+ * The provider's adapter constructor moved: the older lines read a set of
+ * callbacks (`resolveApiKey`, `resolveUserId`, `prepareExtensions`), while from
+ * `0.2.2-rc.1` on it takes one `dependencies` object and calls
+ * `resolveAuth(connection)`, reading `headers` off the result. An adapter fed
+ * the wrong shape does not refuse construction — it fails later as `TRANSPORT`,
+ * which would read as a guard defect. Both shapes are supplied, so the arms
+ * measure the repair rather than this probe's guess at a constructor.
+ * @param chat - drive the chat-completions arm (only on lines that ship one).
+ * @returns the adapter for this line.
+ */
 function makeAdapter(chat = false) {
   return new DeepSeekAdapter({
-    options: () => chat ? chatConnection : connection,
+    options: () => (chat ? chatLine.connection : connection),
+    resolveAuth: async () => ({ headers: { authorization: 'Bearer probe-key-not-a-secret' } }),
     resolveApiKey: async () => 'probe-key-not-a-secret',
     resolveUserId: () => 'probe-user',
     prepareExtensions: async () => ({ fields: {}, accept: async () => {} }),
@@ -98,11 +143,22 @@ const assistantCall = (id, callId, name = 'read_file') => ({
   source: { kind: 'model' },
   content: [{ type: 'tool-call', id: callId, name, arguments: JSON.stringify({ path: 'notes.md' }) }],
 })
+/**
+ * A tool result in the vocabulary the installed line admits.
+ *
+ * From `0.2.1-rc.1` on a result is a first-class `role: 'tool'` message, and a
+ * `tool-result` content block in an interpreted slot is refused at admission —
+ * so a fixture written as the older block never reaches the wire on a newer
+ * line, and the control arm would report a refused request as if the guard or
+ * the serializer had refused it. Asking the line's own constructor keeps the
+ * fixture admissible wherever it runs.
+ * @param id - the message id this fixture gives the result.
+ * @param callId - the call the result answers.
+ * @returns the result message in this line's shape.
+ */
 const toolResult = (id, callId) => ({
+  ...createToolResultMessage({ callId, content: [{ type: 'text', text: 'file contents' }], isError: false }),
   id,
-  role: 'user',
-  source: { kind: 'tool', callId },
-  content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: 'file contents' }] }],
 })
 const request = messages => ({ provider: 'deepseek-official', model: MODEL, messages })
 
@@ -241,6 +297,7 @@ const closedGuard = guard(request(closedSurface), { mode: 'repair', maxRepairs: 
 report.closedTurn.repaired = closedGuard.outcome.repaired
 check('[closed turn] the guard repairs a dangler inside a closed turn', closedGuard.outcome.repaired === true)
 
+async function chatArm() {
 /* chat-completions arm — #7386's hop. This serializer performs no pairing
  * check, so nothing local refuses the request and the evidence has to be the
  * captured wire body. The provider's own criterion, quoted from the report:
@@ -282,6 +339,15 @@ if (ccRepaired.calls.length === 1) {
   check('[chat] the guarded body still carries the declared call — answered, not dropped', body.declaredCalls.includes('call_1'))
 }
 
+}
+
+if (chatLine.ok) {
+  await chatArm()
+} else {
+  report.chatCompletions = { unavailable: chatLine.reason }
+  skip('[chat] arm', chatLine.reason)
+}
+
 /* Control arm — a healthy transcript must not be touched, and must still ship. */
 
 const healthy = request([user('u1', 'read the file'), assistantCall('a1', 'call_1'), toolResult('t1', 'call_1'), user('u2', 'thanks')])
@@ -303,6 +369,7 @@ check('[observe] observe mode leaves the real refusal intact', observeSent.code 
 globalThis.fetch = realFetch
 
 console.log(JSON.stringify(report, null, 2))
-console.log(`\nchecks: ${checks}, failures: ${failures.length}`)
+console.log(`\nchecks: ${checks}, failures: ${failures.length}, skips: ${skips.length}`)
 for (const failure of failures) console.log(`  FAIL ${failure}`)
+for (const reason of skips) console.log(`  SKIP ${reason}`)
 process.exit(failures.length === 0 ? 0 : 1)
